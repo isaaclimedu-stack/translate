@@ -48,6 +48,7 @@ main{display:grid;grid-template-rows:1fr 1fr;gap:10px;min-height:0}
 
 .ph{display:flex;align-items:center;gap:10px;padding:10px 12px;border-bottom:1px solid var(--line)}
 .who{font:700 .72rem var(--body);letter-spacing:.08em;text-transform:uppercase;color:var(--c)}
+.nextTag{font:600 .7rem var(--body);color:var(--c);border:1px solid var(--c);border-radius:999px;padding:2px 8px;white-space:nowrap}
 select{margin-left:auto;font:500 .9rem var(--body);color:var(--fg);background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:5px 8px}
 
 .log{flex:1;overflow-y:auto;padding:12px;display:flex;flex-direction:column;gap:10px;min-height:0}
@@ -74,9 +75,17 @@ form{flex:1;display:flex;gap:6px;min-width:0}
 form input{flex:1;min-width:0;font:1rem var(--body);color:var(--fg);background:var(--bg);border:1px solid var(--line);border-radius:10px;padding:10px 12px}
 form button{font:600 .85rem var(--body);border:1px solid var(--line);background:var(--panel);color:var(--fg);border-radius:10px;padding:0 14px;cursor:pointer}
 
-footer{display:flex;gap:10px;align-items:center;font-size:.8rem;color:var(--muted);min-height:1.5em}
+footer{display:flex;gap:10px;align-items:center;flex-wrap:wrap;font-size:.8rem;color:var(--muted);min-height:1.5em}
+#status{min-width:0;flex:1 1 220px}
 #status.err{color:var(--danger)}
-footer button{margin-left:auto}
+.actions{margin-left:auto;display:flex;gap:8px;align-items:center}
+.save{position:relative}
+.save summary{list-style:none}
+.save summary::-webkit-details-marker{display:none}
+.save .menu{position:absolute;right:0;bottom:calc(100% + 6px);z-index:10;display:flex;flex-direction:column;min-width:230px;
+  background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:6px;box-shadow:0 10px 30px rgba(0,0,0,.18)}
+.save .menu button{text-align:left;border:0;background:none;color:var(--fg);font:500 .88rem var(--body);padding:9px 10px;border-radius:8px;cursor:pointer}
+.save .menu button:hover{background:var(--bg)}
 [dir="rtl"]{text-align:right}
 @media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
 </style>
@@ -92,20 +101,39 @@ footer button{margin-left:auto}
     </div>
   </header>
   <main id="main"></main>
-  <footer><span id="status">Tap a mic and start talking.</span><button class="chip" id="clear" type="button">Clear</button></footer>
+  <footer>
+    <span id="status">Tap a mic and start talking.</span>
+    <div class="actions">
+      <details class="save" id="saveMenu">
+        <summary class="chip">Save conversation</summary>
+        <div class="menu">
+          <button type="button" id="saveDoc">Word document (.doc)</button>
+          <button type="button" id="savePdf">PDF (opens print window)</button>
+          <button type="button" id="saveTxt">Plain text (.txt)</button>
+        </div>
+      </details>
+      <button class="chip" id="clear" type="button">Clear</button>
+    </div>
+  </footer>
 </div>
 
 <script>
+/* speech = what the mic listens for, tr = translation code, tts = voice to read it aloud */
 const LANGS = {
-  en: { label: "English", speech: "en-US" },
-  ko: { label: "한국어 Korean", speech: "ko-KR" },
-  ar: { label: "العربية Arabic", speech: "ar-SA" }
+  en:  { label: "English",            speech: "en-US",       tr: "en",    tts: "en-US" },
+  ko:  { label: "한국어 Korean",       speech: "ko-KR",       tr: "ko",    tts: "ko-KR" },
+  ar:  { label: "العربية Arabic",      speech: "ar-SA",       tr: "ar",    tts: "ar-SA" },
+  zh:  { label: "普通话 Mandarin",     speech: "cmn-Hans-CN", tr: "zh-CN", tts: "zh-CN" },
+  yue: { label: "粵語 Cantonese",      speech: "yue-Hant-HK", tr: "yue",   tts: "zh-HK" },
+  es:  { label: "Español Spanish",    speech: "es-ES",       tr: "es",    tts: "es-ES" },
+  fr:  { label: "Français French",    speech: "fr-FR",       tr: "fr",    tts: "fr-FR" }
 };
 const state = {
   A: { lang: "en" }, B: { lang: "ko" },
-  messages: [], live: null, active: null,
+  messages: [], live: null, active: null, lastSpeaker: null,
   speak: true, handsFree: false
 };
+const nextSpeaker = () => (state.lastSpeaker ? (state.lastSpeaker === "A" ? "B" : "A") : "A");
 const other = s => (s === "A" ? "B" : "A");
 const dirOf = l => (l === "ar" ? "rtl" : "ltr");
 const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
@@ -121,19 +149,29 @@ async function translate(text, sl, tl) {
   if (!text || sl === tl) return text;
   const key = sl + "|" + tl + "|" + text;
   if (cache.has(key)) return cache.get(key);
+  const s = LANGS[sl].tr, t = LANGS[tl].tr;
+  const alt = c => (c === "yue" ? "zh-TW" : c); // fallback if a service doesn't know Cantonese
   let out;
-  try {
-    const r = await fetch("https://translate.googleapis.com/translate_a/single?client=gtx&dt=t&sl=" + sl + "&tl=" + tl + "&q=" + encodeURIComponent(text));
-    if (!r.ok) throw new Error(r.status);
-    const j = await r.json();
-    out = j[0].map(x => x[0]).join("");
-  } catch (e) {
-    const r = await fetch("https://api.mymemory.translated.net/get?langpair=" + sl + "|" + tl + "&q=" + encodeURIComponent(text));
-    const j = await r.json();
-    out = j.responseData.translatedText;
+  try { out = await viaGoogle(text, s, t); }
+  catch (e) {
+    try {
+      if (alt(s) === s && alt(t) === t) throw e;
+      out = await viaGoogle(text, alt(s), alt(t));
+    } catch (_) { out = await viaMyMemory(text, alt(s), alt(t)); }
   }
   cache.set(key, out);
   return out;
+}
+async function viaGoogle(text, s, t) {
+  const r = await fetch("https://translate.googleapis.com/translate_a/single?client=gtx&dt=t&sl=" + s + "&tl=" + t + "&q=" + encodeURIComponent(text));
+  if (!r.ok) throw new Error(r.status);
+  const j = await r.json();
+  return j[0].map(x => x[0]).join("");
+}
+async function viaMyMemory(text, s, t) {
+  const r = await fetch("https://api.mymemory.translated.net/get?langpair=" + s + "|" + t + "&q=" + encodeURIComponent(text));
+  const j = await r.json();
+  return j.responseData.translatedText;
 }
 
 /* ---------- Text to speech ---------- */
@@ -141,8 +179,10 @@ function speak(text, lang, done) {
   if (!state.speak || !window.speechSynthesis || !text) { done && done(); return; }
   speechSynthesis.cancel();
   const u = new SpeechSynthesisUtterance(text);
-  u.lang = LANGS[lang].speech;
-  const v = speechSynthesis.getVoices().find(v => v.lang.toLowerCase().replace("_", "-").startsWith(lang));
+  const tts = LANGS[lang].tts.toLowerCase();
+  u.lang = LANGS[lang].tts;
+  const voices = speechSynthesis.getVoices(), norm = v => v.lang.toLowerCase().replace("_", "-");
+  const v = voices.find(v => norm(v) === tts) || voices.find(v => norm(v).startsWith(tts.split("-")[0]));
   if (v) u.voice = v;
   else setStatus("No " + LANGS[lang].label + " voice installed on this device, so it is shown as text only.");
   u.onend = u.onerror = () => done && done();
@@ -152,6 +192,9 @@ if (window.speechSynthesis) speechSynthesis.onvoiceschanged = () => {};
 
 /* ---------- Speech recognition ---------- */
 let rec = null, liveTimer = null, liveSeq = 0;
+function finishListening() {
+  if (rec) { try { rec.stop(); } catch (_) { stopListening(); } } else stopListening();
+}
 function stopListening() {
   if (rec) { rec.onend = null; try { rec.abort(); } catch (_) {} rec = null; }
   state.active = null; state.live = null; render();
@@ -210,8 +253,9 @@ async function commit(side, text) {
   if (!text) return;
   liveSeq++;
   const to = other(side);
-  const m = { from: side, src: state[side].lang, original: text, translated: null };
+  const m = { from: side, src: state[side].lang, to: state[to].lang, time: Date.now(), original: text, translated: null };
   state.messages.push(m);
+  state.lastSpeaker = side;
   render();
   try {
     m.translated = await translate(text, m.src, state[to].lang);
@@ -228,7 +272,7 @@ async function commit(side, text) {
 
 async function retranslateFor(side) {
   for (const m of state.messages) if (m.from !== side) {
-    m.translated = null; render();
+    m.translated = null; m.to = state[side].lang; render();
     try { m.translated = await translate(m.original, m.src, state[side].lang); } catch (_) { m.translated = "(Couldn't translate.)"; }
   }
   render();
@@ -243,6 +287,7 @@ function buildPanels() {
     <section class="panel ${s}" id="p${s}">
       <div class="ph">
         <span class="who">Person ${s}</span>
+        <span class="nextTag" id="next${s}" hidden>Next · Space</span>
         <select id="lang${s}" aria-label="Person ${s} language">
           ${Object.entries(LANGS).map(([k, v]) => `<option value="${k}" ${state[s].lang === k ? "selected" : ""}>${v.label}</option>`).join("")}
         </select>
@@ -254,13 +299,14 @@ function buildPanels() {
       </div>
     </section>`).join("");
   ["A", "B"].forEach(s => {
-    $("mic" + s).onclick = () => (state.active === s ? stopListening() : startListening(s));
+    $("mic" + s).onclick = () => (state.active === s ? finishListening() : startListening(s));
     $("form" + s).onsubmit = e => { e.preventDefault(); const v = $("in" + s).value; $("in" + s).value = ""; commit(s, v); };
     $("lang" + s).onchange = e => { state[s].lang = e.target.value; render(); retranslateFor(s); };
   });
 }
 
 function render() {
+  try { localStorage.setItem("interpreterTable", JSON.stringify({ A: state.A.lang, B: state.B.lang, messages: state.messages.filter(m => m.translated !== null) })); } catch (_) {}
   ["A", "B"].forEach(s => {
     const L = state[s].lang;
     const log = $("log" + s);
@@ -270,6 +316,7 @@ function render() {
       : `<p class="empty">Tap the mic and speak ${esc(LANGS[L].label)}. Your words appear in the other panel, translated.</p>`;
     log.scrollTop = log.scrollHeight;
     $("p" + s).classList.toggle("listening", state.active === s);
+    $("next" + s).hidden = !!state.active || nextSpeaker() !== s;
     $("mic" + s).innerHTML = state.active === s ? stopIcon : micIcon;
     $("mic" + s).setAttribute("aria-label", state.active === s ? "Stop listening" : "Talk as Person " + s);
   });
@@ -311,10 +358,112 @@ function bindToggle(id, key, cb) {
 bindToggle("tSpeak", "speak", on => { if (!on && window.speechSynthesis) speechSynthesis.cancel(); });
 bindToggle("tHands", "handsFree");
 bindToggle("tFlip", null, on => $("app").classList.toggle("flipped", on));
-$("clear").onclick = () => { stopListening(); if (window.speechSynthesis) speechSynthesis.cancel(); state.messages = []; render(); setStatus("Cleared."); };
+$("clear").onclick = () => { stopListening(); if (window.speechSynthesis) speechSynthesis.cancel(); state.messages = []; state.lastSpeaker = null; render(); setStatus("Cleared."); };
+
+/* ---------- Saving the conversation ---------- */
+const pad = n => String(n).padStart(2, "0");
+const fmtTime = t => { const d = new Date(t); return pad(d.getHours()) + ":" + pad(d.getMinutes()); };
+function fileStamp() { const d = new Date(); return d.getFullYear() + "-" + pad(d.getMonth() + 1) + "-" + pad(d.getDate()) + "-" + pad(d.getHours()) + pad(d.getMinutes()); }
+function langName(k) { return (LANGS[k] && LANGS[k].label) || k; }
+
+function transcriptHTML(forPrint) {
+  const first = state.messages[0], when = new Date(first ? first.time : Date.now());
+  const turns = state.messages.map(m => `
+    <div class="turn ${m.from}">
+      <p class="who">${fmtTime(m.time)} &nbsp;·&nbsp; Person ${m.from} <span>(${esc(langName(m.src))})</span></p>
+      <p class="orig" dir="${dirOf(m.src)}" lang="${m.src}">${esc(m.original)}</p>
+      <p class="tr" dir="${dirOf(m.to)}" lang="${m.to}"><span class="tag">${esc(langName(m.to))}:</span> ${esc(m.translated || "")}</p>
+    </div>`).join("");
+  return `<!doctype html><html><head><meta charset="utf-8"><title>Conversation ${fileStamp()}</title>
+<style>
+body{font-family:"IBM Plex Sans","Apple SD Gothic Neo","PingFang SC","Geeza Pro",Arial,sans-serif;color:#15202b;max-width:720px;margin:32px auto;padding:0 20px;line-height:1.5}
+h1{font-size:22px;margin:0 0 4px}
+.info{color:#5a6976;font-size:13px;margin:0 0 20px;border-bottom:1px solid #d6dee4;padding-bottom:12px}
+.turn{padding:10px 0 10px 12px;border-left:3px solid #0d7466;margin:0 0 12px;page-break-inside:avoid}
+.turn.B{border-left-color:#b0501c}
+.who{font-size:12px;color:#5a6976;margin:0;font-weight:600}
+.orig{font-size:16px;margin:2px 0}
+.tr{font-size:14px;color:#3b4853;margin:0}
+.tag{font-size:12px;color:#5a6976}
+[dir=rtl]{text-align:right}
+.bar{margin:0 0 20px}
+.bar button{font:600 14px Arial,sans-serif;padding:8px 14px;border-radius:8px;border:1px solid #15202b;background:#15202b;color:#fff;cursor:pointer}
+@media print{.bar{display:none}body{margin:0 auto}}
+</style></head><body>
+${forPrint ? '<div class="bar"><button onclick="window.print()">Save as PDF / Print</button></div>' : ""}
+<h1>Conversation transcript</h1>
+<p class="info">${when.toLocaleDateString(undefined, { year: "numeric", month: "long", day: "numeric" })} &nbsp;·&nbsp; Person A: ${esc(langName(state.A.lang))} &nbsp;·&nbsp; Person B: ${esc(langName(state.B.lang))} &nbsp;·&nbsp; ${state.messages.length} messages</p>
+${turns}
+</body></html>`;
+}
+
+function transcriptText() {
+  const lines = ["Conversation transcript", new Date().toLocaleString(), ""];
+  state.messages.forEach(m => {
+    lines.push("[" + fmtTime(m.time) + "] Person " + m.from + " (" + langName(m.src) + ")");
+    lines.push("  " + m.original);
+    lines.push("  → " + langName(m.to) + ": " + (m.translated || ""));
+    lines.push("");
+  });
+  return lines.join("\n");
+}
+
+function download(name, type, content) {
+  const url = URL.createObjectURL(new Blob(["﻿" + content], { type }));
+  const a = document.createElement("a");
+  a.href = url; a.download = name;
+  document.body.appendChild(a); a.click();
+  setTimeout(() => { URL.revokeObjectURL(url); a.remove(); }, 1000);
+}
+
+function saveAs(kind) {
+  $("saveMenu").open = false;
+  if (!state.messages.length) { setStatus("Nothing to save yet. Have a conversation first."); return; }
+  if (kind === "doc") {
+    download("conversation-" + fileStamp() + ".doc", "application/msword", transcriptHTML(false));
+    setStatus("Saved a Word document to your Downloads folder.");
+  } else if (kind === "txt") {
+    download("conversation-" + fileStamp() + ".txt", "text/plain;charset=utf-8", transcriptText());
+    setStatus("Saved a text file to your Downloads folder.");
+  } else {
+    const w = window.open("", "_blank");
+    if (!w) { setStatus("Your browser blocked the new window. Allow pop-ups for this site and try again.", true); return; }
+    w.document.write(transcriptHTML(true)); w.document.close();
+    setTimeout(() => { try { w.focus(); w.print(); } catch (_) {} }, 400);
+    setStatus("Opened the transcript. Choose Save as PDF in the print window.");
+  }
+}
+$("saveDoc").onclick = () => saveAs("doc");
+$("savePdf").onclick = () => saveAs("pdf");
+$("saveTxt").onclick = () => saveAs("txt");
+document.addEventListener("click", e => { if (!e.target.closest("#saveMenu")) $("saveMenu").open = false; });
+
+/* Restore the last conversation after a refresh */
+try {
+  const saved = JSON.parse(localStorage.getItem("interpreterTable") || "null");
+  if (saved) {
+    if (LANGS[saved.A]) state.A.lang = saved.A;
+    if (LANGS[saved.B]) state.B.lang = saved.B;
+    if (Array.isArray(saved.messages)) {
+      state.messages = saved.messages.filter(m => m && LANGS[m.src]).map(m => ({ ...m, to: m.to || state[m.from === "A" ? "B" : "A"].lang, time: m.time || Date.now() }));
+      const last = state.messages[state.messages.length - 1];
+      if (last) state.lastSpeaker = last.from;
+    }
+  }
+} catch (_) {}
+
+/* Space bar: start listening for whoever's turn is next; press again to finish */
+document.addEventListener("keydown", e => {
+  if (e.code !== "Space" || e.repeat || e.metaKey || e.ctrlKey || e.altKey) return;
+  if (e.target.closest && e.target.closest("input, textarea, select")) return;
+  e.preventDefault();
+  if (state.active) finishListening();
+  else startListening(nextSpeaker());
+});
 
 buildPanels();
 render();
+setStatus("Press Space to talk. Turns alternate between Person A and Person B, or tap a mic to choose.");
 if (!SR) setStatus("Voice input needs Chrome or Edge. You can still type below each panel.", true);
 </script>
 </body>
