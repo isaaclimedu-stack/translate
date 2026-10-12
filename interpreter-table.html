@@ -59,7 +59,15 @@ nav{display:flex;flex-direction:column;gap:4px}
 .mode.live{color:var(--ok)}
 .mode .dot{margin:0}
 .mode + .mode{border-left:1px solid var(--line);border-radius:0 999px 999px 0}
-.mode[aria-pressed="false"]{color:var(--muted)}
+.mode .tog{width:34px;height:20px;border-radius:999px;background:var(--line);position:relative;transition:background .2s}
+.mode .tog span{position:absolute;top:2px;left:2px;width:16px;height:16px;border-radius:50%;background:#fff;box-shadow:0 1px 3px rgba(0,0,0,.25);transition:transform .2s}
+.mode[aria-checked="true"] .tog{background:var(--accent)}
+.mode[aria-checked="true"] .tog span{transform:translateX(14px)}
+.mode .toglabel{min-width:2em;font-weight:700}
+.mode[aria-checked="false"]{color:var(--muted)}
+.mode[aria-checked="true"] #voiceMute,.mode[aria-checked="false"] #voiceWaves{display:none}
+.topbar .left{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.undo{border:0;background:none;color:var(--accent);font-weight:800;padding:0 0 0 6px;cursor:pointer}
 .mode svg{width:18px;height:18px}
 .langs{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
 .langsel{display:flex;align-items:center;gap:8px;border:1px solid var(--line);border-radius:999px;padding:4px 6px 4px 14px;background:var(--card)}
@@ -220,11 +228,15 @@ dialog::backdrop{background:rgba(10,16,32,.45)}
 
   <main class="main" id="live">
     <div class="topbar">
+      <div class="left">
       <div class="modes">
         <span class="mode live"><span class="dot" id="modeDot"></span>Real-time Mode</span>
-        <button class="mode" id="voiceToggle" type="button" aria-pressed="true" title="Read translations aloud">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 10v4M8 7v10M12 4v16M16 8v8M20 11v2"/></svg>
-          <span id="voiceLabel">Voice + Text</span></button>
+        <button class="mode" id="voiceToggle" type="button" role="switch" aria-checked="false" title="Turn reading translations aloud on or off">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 5 6 9H3v6h3l5 4z"/><path id="voiceWaves" d="M15.5 8.5a5 5 0 0 1 0 7M18.5 5.5a9 9 0 0 1 0 13"/><path id="voiceMute" d="M16 9l6 6M22 9l-6 6"/></svg>
+          <span>Read aloud</span><span class="tog" aria-hidden="true"><span></span></span><span id="voiceLabel" class="toglabel">Off</span></button>
+      </div>
+      <button class="btn" id="clearTop" type="button" title="Clear the conversation">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13"/></svg>Clear</button>
       </div>
       <div class="langs">
         <label class="langsel"><span class="who">Person A</span><select id="langA" aria-label="Person A language"></select></label>
@@ -241,6 +253,7 @@ dialog::backdrop{background:rgba(10,16,32,.45)}
       <div class="hhead">
         <h2>Conversation</h2><span class="count" id="histCount"></span>
         <div class="acts">
+          <button class="btn" id="clearHist" type="button">Clear</button>
           <button class="btn primary" id="openSave" type="button">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12M7 10l5 5 5-5M5 21h14"/></svg>Save &amp; review</button>
         </div>
@@ -279,7 +292,7 @@ dialog::backdrop{background:rgba(10,16,32,.45)}
 <dialog id="dlgSettings" aria-labelledby="setTitle">
   <div class="dhead"><h3 id="setTitle">Settings</h3><button class="x" type="button" data-close aria-label="Close">×</button></div>
   <div class="dbody">
-    <label class="switch"><span><b>Read translations aloud</b><small>Plays each translation for the other person.</small></span><input type="checkbox" id="optSpeak" checked></label>
+    <label class="switch"><span><b>Read translations aloud</b><small>Plays each translation for the other person.</small></span><input type="checkbox" id="optSpeak"></label>
     <label class="switch"><span><b>Hands-free turns</b><small>After a translation plays, the other person's mic turns on.</small></span><input type="checkbox" id="optHands"></label>
     <label class="switch"><span><b>Flip top card on phones</b><small>So someone sitting across the table can read it.</small></span><input type="checkbox" id="optFlip"></label>
     <div class="row"><button class="btn danger" type="button" id="clear">Clear conversation</button></div>
@@ -303,7 +316,7 @@ const state = {
   A: { lang: "en" }, B: { lang: "ko" },
   messages: [], live: null, active: null, lastSpeaker: null,
   phase: "idle", phaseSide: null,       // idle | listening | processing | playing ; phaseSide = who spoke
-  speak: true, handsFree: false, flip: false
+  speak: false, handsFree: false, flip: false
 };
 const other = s => (s === "A" ? "B" : "A");
 const dirOf = l => (l === "ar" ? "rtl" : "ltr");
@@ -649,7 +662,7 @@ function renderCards() {
     else if (ph === "processing") { cls = "processing"; html = '<span class="dots">Translating</span>'; }
     else if (ph === "playing" && ps !== s) { cls = "playing"; html = ICON.speaker + '<span class="dots">Playing translation</span>'; }
     else if (ph === "playing") { html = "Playing the translation for Person " + other(s); }
-    else if (isListener && latest.translated) { html = `<button type="button" data-replay>${ICON.speaker}Play translation</button>`; }
+    else if (isListener && latest.translated && state.speak) { html = `<button type="button" data-replay>${ICON.speaker}Play translation</button>`; }
     else if (latest) { html = "Sent at " + fmtTime(latest.time); }
     else { html = SR ? "Ready" : "Voice input needs Chrome or Edge"; }
     st.className = "state " + cls;
@@ -677,8 +690,8 @@ function renderControlsStatus() {
   };
   $("connTitle").textContent = titles[ph][0];
   $("connSub").textContent = titles[ph][1];
-  $("voiceToggle").setAttribute("aria-pressed", state.speak);
-  $("voiceLabel").textContent = state.speak ? "Voice + Text" : "Text only";
+  $("voiceToggle").setAttribute("aria-checked", state.speak);
+  $("voiceLabel").textContent = state.speak ? "On" : "Off";
   $("langA").value = state.A.lang; $("langB").value = state.B.lang;
   $("app").classList.toggle("flipped", state.flip);
 }
@@ -917,7 +930,7 @@ async function saveAs(kind) {
 
 /* ---------- Remember the conversation in this browser ---------- */
 function save() {
-  try { localStorage.setItem("interpreterTable", JSON.stringify({ A: state.A.lang, B: state.B.lang, speak: state.speak, handsFree: state.handsFree, flip: state.flip, messages: state.messages.filter(m => m.translated !== null) })); } catch (_) {}
+  try { localStorage.setItem("interpreterTable", JSON.stringify({ A: state.A.lang, B: state.B.lang, readAloud: state.speak, handsFree: state.handsFree, flip: state.flip, messages: state.messages.filter(m => m.translated !== null) })); } catch (_) {}
 }
 function restore() {
   try {
@@ -925,7 +938,7 @@ function restore() {
     if (saved) {
       if (LANGS[saved.A]) state.A.lang = saved.A;
       if (LANGS[saved.B]) state.B.lang = saved.B;
-      if (typeof saved.speak === "boolean") state.speak = saved.speak;
+      if (typeof saved.readAloud === "boolean") state.speak = saved.readAloud;
       if (typeof saved.handsFree === "boolean") state.handsFree = saved.handsFree;
       if (typeof saved.flip === "boolean") state.flip = saved.flip;
       if (Array.isArray(saved.messages)) {
@@ -951,22 +964,37 @@ function fillSelects() {
     setStatus("Swapped. Person A now speaks " + langName(state.A.lang) + " and Person B speaks " + langName(state.B.lang) + ".");
   };
 }
-$("voiceToggle").onclick = () => { state.speak = !state.speak; if (!state.speak) stopSpeaking(); renderAll(); };
+$("voiceToggle").onclick = () => {
+  state.speak = !state.speak;
+  if (!state.speak) stopSpeaking();
+  renderAll();
+  setStatus(state.speak ? "Read aloud is on. Translations will be spoken for the other person." : "Read aloud is off. Translations are shown as text only.");
+};
 $("optSpeak").onchange = e => { state.speak = e.target.checked; if (!state.speak) stopSpeaking(); renderAll(); };
 $("optHands").onchange = e => { state.handsFree = e.target.checked; save(); };
 $("optFlip").onchange = e => { state.flip = e.target.checked; renderAll(); };
-let clearArmed = false;
-$("clear").onclick = () => {
-  if (!clearArmed) {
-    clearArmed = true; $("clear").textContent = "Click again to clear everything";
-    setTimeout(() => { clearArmed = false; $("clear").textContent = "Clear conversation"; }, 4000);
-    return;
-  }
-  clearArmed = false; $("clear").textContent = "Clear conversation";
+let undoData = null, undoTimer = null;
+function clearConversation() {
+  if (!state.messages.length && !state.active) { setStatus("The conversation is already empty."); return; }
   stopListening(); stopSpeaking();
+  undoData = { messages: state.messages, lastSpeaker: state.lastSpeaker, review };
   state.messages = []; state.lastSpeaker = null; review = null; saveReview();
-  renderAll(); $("dlgSettings").close(); setStatus("Conversation cleared.");
-};
+  renderAll();
+  if ($("dlgSettings").open) $("dlgSettings").close();
+  const s = $("status");
+  s.className = "statusline";
+  s.innerHTML = 'Conversation cleared.<button class="undo" type="button" id="undoClear">Undo</button>';
+  $("undoClear").onclick = () => {
+    if (!undoData) return;
+    state.messages = undoData.messages; state.lastSpeaker = undoData.lastSpeaker; review = undoData.review; saveReview();
+    undoData = null; renderAll(); setStatus("Conversation restored.");
+  };
+  clearTimeout(undoTimer);
+  undoTimer = setTimeout(() => { undoData = null; const u = $("undoClear"); if (u) setStatus(""); }, 10000);
+}
+$("clearTop").onclick = clearConversation;
+$("clearHist").onclick = clearConversation;
+$("clear").onclick = clearConversation;
 
 function openDialog(id) {
   if (id === "dlgSave") updateReviewState();
