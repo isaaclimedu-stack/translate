@@ -48,6 +48,7 @@ main{display:grid;grid-template-rows:1fr 1fr;gap:10px;min-height:0}
 
 .ph{display:flex;align-items:center;gap:10px;padding:10px 12px;border-bottom:1px solid var(--line)}
 .who{font:700 .72rem var(--body);letter-spacing:.08em;text-transform:uppercase;color:var(--c)}
+.key{font:600 .7rem var(--body);color:var(--muted);background:var(--bg);border:1px solid var(--line);border-bottom-width:2px;border-radius:6px;padding:1px 6px;white-space:nowrap}
 .nextTag{font:600 .7rem var(--body);color:var(--c);border:1px solid var(--c);border-radius:999px;padding:2px 8px;white-space:nowrap}
 select{margin-left:auto;font:500 .9rem var(--body);color:var(--fg);background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:5px 8px}
 
@@ -175,63 +176,127 @@ async function viaMyMemory(text, s, t) {
 }
 
 /* ---------- Text to speech ---------- */
+/* Chrome often stops long utterances partway, so speak one short chunk at a time */
+function splitChunks(text, max = 160) {
+  const parts = text.match(/[^.!?。！？؟\n]+[.!?。！？؟]*[\s\n]*/g) || [text];
+  const out = []; let cur = "";
+  const flush = () => { if (cur.trim()) out.push(cur.trim()); cur = ""; };
+  for (let p of parts) {
+    while (p.length > max) {
+      flush();
+      let cut = Math.max(p.lastIndexOf(",", max), p.lastIndexOf("，", max), p.lastIndexOf("、", max), p.lastIndexOf(" ", max));
+      if (cut < max / 3) cut = max;
+      out.push(p.slice(0, cut + 1).trim());
+      p = p.slice(cut + 1);
+    }
+    if ((cur + p).length > max) flush();
+    cur += p;
+  }
+  flush();
+  return out.length ? out : [text];
+}
 function speak(text, lang, done) {
   if (!state.speak || !window.speechSynthesis || !text) { done && done(); return; }
   speechSynthesis.cancel();
-  const u = new SpeechSynthesisUtterance(text);
   const tts = LANGS[lang].tts.toLowerCase();
-  u.lang = LANGS[lang].tts;
   const voices = speechSynthesis.getVoices(), norm = v => v.lang.toLowerCase().replace("_", "-");
   const v = voices.find(v => norm(v) === tts) || voices.find(v => norm(v).startsWith(tts.split("-")[0]));
-  if (v) u.voice = v;
-  else setStatus("No " + LANGS[lang].label + " voice installed on this device, so it is shown as text only.");
-  u.onend = u.onerror = () => done && done();
-  speechSynthesis.speak(u);
+  if (!v) setStatus("No " + LANGS[lang].label + " voice installed on this device, so it is shown as text only.");
+  const chunks = splitChunks(text);
+  let i = 0;
+  const next = () => {
+    if (i >= chunks.length) { done && done(); return; }
+    const u = new SpeechSynthesisUtterance(chunks[i++]);
+    u.lang = LANGS[lang].tts;
+    if (v) u.voice = v;
+    u.onend = next;
+    u.onerror = ev => { if (ev.error === "interrupted" || ev.error === "canceled") return; next(); };
+    speechSynthesis.speak(u);
+  };
+  setTimeout(next, 60); // give cancel() a moment so the first chunk isn't dropped
 }
 if (window.speechSynthesis) speechSynthesis.onvoiceschanged = () => {};
 
 /* ---------- Speech recognition ---------- */
-let rec = null, liveTimer = null, liveSeq = 0;
+/* Listens continuously until the speaker finishes: key/mic pressed again, Shift released after holding, or 4s of silence */
+let rec = null, liveTimer = null, liveSeq = 0, silenceTimer = null, holding = null;
+const SILENCE_MS = 4000;
+const listen = { side: null, want: false, finalText: "", interim: "" };
+const noSpaceLang = l => l === "zh" || l === "yue";
+
 function finishListening() {
-  if (rec) { try { rec.stop(); } catch (_) { stopListening(); } } else stopListening();
+  listen.want = false;
+  clearTimeout(silenceTimer);
+  if (rec) { try { rec.stop(); } catch (_) { finalize(); } } else finalize();
 }
 function stopListening() {
+  listen.want = false;
+  clearTimeout(silenceTimer);
   if (rec) { rec.onend = null; try { rec.abort(); } catch (_) {} rec = null; }
+  listen.side = null; listen.finalText = ""; listen.interim = "";
   state.active = null; state.live = null; render();
+}
+function finalize() {
+  const side = listen.side;
+  const text = (listen.finalText + (listen.interim ? (noSpaceLang(state[side]?.lang) ? "" : " ") + listen.interim : "")).trim();
+  rec = null; listen.side = null; listen.finalText = ""; listen.interim = "";
+  state.active = null; state.live = null;
+  render();
+  if (side && text) commit(side, text);
+  else if (side) setStatus("Didn't catch anything. Try again.");
+}
+function armSilence() {
+  clearTimeout(silenceTimer);
+  silenceTimer = setTimeout(() => { if (listen.want && !holding) finishListening(); }, SILENCE_MS);
 }
 function startListening(side) {
   if (!SR) { setStatus("Voice input needs Chrome or Edge. You can still type below each panel.", true); return; }
   if (window.speechSynthesis) speechSynthesis.cancel();
   stopListening();
-  const lang = state[side].lang;
   state.active = side;
-  rec = new SR();
-  rec.lang = LANGS[lang].speech;
-  rec.continuous = false;
-  rec.interimResults = true;
-  let committed = false;
-  rec.onresult = e => {
-    let interim = "", final = "";
-    for (let i = e.resultIndex; i < e.results.length; i++) {
-      const r = e.results[i];
-      if (r.isFinal) final += r[0].transcript; else interim += r[0].transcript;
-    }
-    if (final) { committed = true; state.live = null; commit(side, final); }
-    else setLive(side, interim);
-  };
-  rec.onerror = e => {
-    if (e.error === "not-allowed" || e.error === "service-not-allowed")
-      setStatus("Microphone is blocked. Allow mic access from the icon in the address bar, then try again.", true);
-    else if (e.error === "no-speech") setStatus("Didn't hear anything. Tap the mic and try again.");
-    else if (e.error !== "aborted") setStatus("Speech recognition error: " + e.error, true);
-  };
-  rec.onend = () => {
-    if (!committed && state.live && state.live.original) commit(side, state.live.original);
-    rec = null; state.active = null; state.live = null; render();
-  };
-  rec.start();
-  setStatus("Listening in " + LANGS[lang].label + "…");
+  listen.side = side; listen.want = true;
+  openRec(side);
+  setStatus("Listening in " + LANGS[state[side].lang].label + "… Press again (or pause for a few seconds) when finished.");
   render();
+}
+function openRec(side) {
+  const lang = state[side].lang;
+  const r = new SR();
+  rec = r;
+  r.lang = LANGS[lang].speech;
+  r.continuous = true;
+  r.interimResults = true;
+  r.onresult = e => {
+    let interim = "";
+    for (let i = e.resultIndex; i < e.results.length; i++) {
+      const res = e.results[i];
+      if (res.isFinal) {
+        const t = res[0].transcript.trim();
+        if (t) listen.finalText += (listen.finalText && !noSpaceLang(lang) ? " " : "") + t;
+      } else interim += res[0].transcript;
+    }
+    listen.interim = interim.trim();
+    const sep = listen.finalText && listen.interim && !noSpaceLang(lang) ? " " : "";
+    setLive(side, listen.finalText + sep + listen.interim);
+    armSilence();
+  };
+  r.onerror = e => {
+    if (e.error === "not-allowed" || e.error === "service-not-allowed") {
+      listen.want = false;
+      setStatus("Microphone is blocked. Allow mic access from the icon in the address bar, then try again.", true);
+    } else if (e.error === "network") {
+      setStatus("Speech recognition lost its connection. Check your internet.", true);
+    } else if (e.error !== "no-speech" && e.error !== "aborted") {
+      setStatus("Speech recognition error: " + e.error, true);
+    }
+  };
+  r.onend = () => {
+    if (rec !== r) return;
+    // Chrome ends sessions on its own after a while; keep going if the speaker hasn't finished
+    if (listen.want && state.active === side) { try { openRec(side); return; } catch (_) {} }
+    finalize();
+  };
+  r.start();
 }
 
 function setLive(side, text) {
@@ -287,6 +352,7 @@ function buildPanels() {
     <section class="panel ${s}" id="p${s}">
       <div class="ph">
         <span class="who">Person ${s}</span>
+        <kbd class="key" title="Keyboard shortcut">${s === "A" ? "Left" : "Right"} ⇧</kbd>
         <span class="nextTag" id="next${s}" hidden>Next · Space</span>
         <select id="lang${s}" aria-label="Person ${s} language">
           ${Object.entries(LANGS).map(([k, v]) => `<option value="${k}" ${state[s].lang === k ? "selected" : ""}>${v.label}</option>`).join("")}
@@ -453,17 +519,39 @@ try {
 } catch (_) {}
 
 /* Space bar: start listening for whoever's turn is next; press again to finish */
+/* Left Shift = Person A (left panel), Right Shift = Person B (right panel).
+   Tap once to start and tap again to finish, or hold while talking and release to finish. */
+const SHIFT_SIDE = { ShiftLeft: "A", ShiftRight: "B" };
+let shiftDownAt = 0;
+const typing = e => e.target.closest && e.target.closest("input, textarea, select");
 document.addEventListener("keydown", e => {
-  if (e.code !== "Space" || e.repeat || e.metaKey || e.ctrlKey || e.altKey) return;
-  if (e.target.closest && e.target.closest("input, textarea, select")) return;
-  e.preventDefault();
-  if (state.active) finishListening();
-  else startListening(nextSpeaker());
+  if (e.repeat || e.metaKey || e.ctrlKey || e.altKey || typing(e)) return;
+  if (SHIFT_SIDE[e.code]) {
+    const side = SHIFT_SIDE[e.code];
+    if (state.active === side) { finishListening(); return; }
+    startListening(side);
+    holding = side; shiftDownAt = performance.now();
+    return;
+  }
+  if (e.code === "Space") {
+    e.preventDefault();
+    if (state.active) finishListening();
+    else startListening(nextSpeaker());
+  }
 });
+document.addEventListener("keyup", e => {
+  const side = SHIFT_SIDE[e.code];
+  if (!side || holding !== side) return;
+  holding = null;
+  // Held longer than a tap: treat it as push-to-talk and finish on release
+  if (performance.now() - shiftDownAt > 600 && state.active === side) finishListening();
+  else if (state.active === side) armSilence();
+});
+window.addEventListener("blur", () => { holding = null; });
 
 buildPanels();
 render();
-setStatus("Press Space to talk. Turns alternate between Person A and Person B, or tap a mic to choose.");
+setStatus("Left Shift talks for Person A, Right Shift for Person B. Tap to start and tap again to finish, or hold while you talk.");
 if (!SR) setStatus("Voice input needs Chrome or Edge. You can still type below each panel.", true);
 </script>
 </body>
