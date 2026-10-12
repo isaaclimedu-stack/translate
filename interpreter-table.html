@@ -86,6 +86,13 @@ footer{display:flex;gap:10px;align-items:center;flex-wrap:wrap;font-size:.8rem;c
   background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:6px;box-shadow:0 10px 30px rgba(0,0,0,.18)}
 .save .menu button{text-align:left;border:0;background:none;color:var(--fg);font:500 .88rem var(--body);padding:9px 10px;border-radius:8px;cursor:pointer}
 .save .menu button:hover{background:var(--bg)}
+.save .menu{min-width:min(300px,calc(100vw - 32px))}
+.review{display:flex;flex-direction:column;gap:6px;padding:8px 10px 10px;margin-bottom:4px;border-bottom:1px solid var(--line)}
+.check{display:flex;gap:8px;align-items:center;font:600 .86rem var(--body);color:var(--fg);cursor:pointer}
+.keyrow{display:flex;gap:6px}
+.keyrow input{flex:1;min-width:0;font:.82rem var(--body);color:var(--fg);background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:6px 8px}
+.save .menu .keyrow button{border:1px solid var(--line);padding:6px 10px;font-size:.8rem;white-space:nowrap}
+.hint{margin:0;font-size:.74rem;color:var(--muted);line-height:1.35}
 [dir="rtl"]{text-align:right}
 @media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
 </style>
@@ -107,6 +114,14 @@ footer{display:flex;gap:10px;align-items:center;flex-wrap:wrap;font-size:.8rem;c
       <details class="save" id="saveMenu">
         <summary class="chip">Save conversation</summary>
         <div class="menu">
+          <div class="review">
+            <label class="check"><input type="checkbox" id="reviewOn"> Add suggestions &amp; corrections</label>
+            <div class="keyrow">
+              <input type="password" id="apiKey" placeholder="Claude API key (sk-ant-…)" autocomplete="off" spellcheck="false">
+              <button type="button" id="keySave">Save key</button>
+            </div>
+            <p class="hint" id="keyHint">Uses your Claude API key. It stays in this browser only and is never uploaded to GitHub.</p>
+          </div>
           <button type="button" id="saveDoc">Word document (.doc)</button>
           <button type="button" id="savePdf">PDF (opens print window)</button>
           <button type="button" id="saveTxt">Plain text (.txt)</button>
@@ -427,45 +442,163 @@ const fmtTime = t => { const d = new Date(t); return pad(d.getHours()) + ":" + p
 function fileStamp() { const d = new Date(); return d.getFullYear() + "-" + pad(d.getMonth() + 1) + "-" + pad(d.getDate()) + "-" + pad(d.getHours()) + pad(d.getMinutes()); }
 function langName(k) { return (LANGS[k] && LANGS[k].label) || k; }
 
-function transcriptHTML(forPrint) {
+/* ---------- AI review (suggestions & corrections) via the user's own Claude API key ---------- */
+const KEY_STORE = "interpreterTableKey", REVIEW_STORE = "interpreterTableReview";
+const REVIEW_MODEL = "claude-sonnet-5-5";
+let reviewCache = { sig: "", data: null };
+function getKey() { try { return localStorage.getItem(KEY_STORE) || ""; } catch (_) { return ""; } }
+function setKey(k) { try { k ? localStorage.setItem(KEY_STORE, k) : localStorage.removeItem(KEY_STORE); } catch (_) {} }
+function reviewWanted() { return $("reviewOn").checked; }
+
+function refreshKeyUI() {
+  const has = !!getKey();
+  $("apiKey").value = "";
+  $("apiKey").placeholder = has ? "Key saved ✓ (paste a new one to replace)" : "Claude API key (sk-ant-…)";
+  $("keySave").textContent = has ? "Remove key" : "Save key";
+  $("keySave").dataset.mode = has ? "remove" : "save";
+}
+$("keySave").onclick = () => {
+  if ($("keySave").dataset.mode === "remove" && !$("apiKey").value.trim()) {
+    setKey(""); refreshKeyUI(); setStatus("API key removed from this browser."); return;
+  }
+  const k = $("apiKey").value.trim();
+  if (!k) { setStatus("Paste your Claude API key first.", true); return; }
+  setKey(k); refreshKeyUI(); setStatus("API key saved in this browser.");
+};
+$("apiKey").addEventListener("input", () => { if ($("apiKey").value.trim()) { $("keySave").textContent = "Save key"; $("keySave").dataset.mode = "save"; } });
+$("reviewOn").onchange = () => { try { localStorage.setItem(REVIEW_STORE, $("reviewOn").checked ? "1" : "0"); } catch (_) {} };
+try { $("reviewOn").checked = localStorage.getItem(REVIEW_STORE) !== "0"; } catch (_) { $("reviewOn").checked = true; }
+refreshKeyUI();
+
+async function getReview() {
+  const key = getKey();
+  if (!key) throw { friendly: "Add your Claude API key in the Save menu to get suggestions and corrections." };
+  const msgs = state.messages.map((m, i) => ({
+    i, speaker: "Person " + m.from, language: langName(m.src), said: m.original,
+    machine_translation: m.translated || "", translated_into: langName(m.to)
+  }));
+  const sig = JSON.stringify(msgs);
+  if (reviewCache.sig === sig) return reviewCache.data;
+
+  const instructions = `You are reviewing a transcript of a spoken conversation between two people. Each message was captured by automatic speech recognition, then machine-translated for the other person. Help the reader learn from it and catch misunderstandings.
+
+For each message, only where it is genuinely useful:
+- "correction": a corrected, natural version of what the speaker said, in the speaker's own language, if it has grammar mistakes, unnatural wording, or likely speech-recognition errors. Leave it null if it was fine.
+- "correction_reason": one short sentence explaining the fix.
+- "better_translation": a more accurate or natural translation, in the translated_into language, if the machine translation is wrong, awkward, or loses meaning. Leave it null if it was fine.
+- "note": optional short note about a possible misunderstanding, tone, or cultural point. Otherwise null.
+Skip messages that need nothing.
+
+Also give:
+- "summary": one or two sentences describing what the conversation was about.
+- "suggestions": two to five short, practical tips for the speakers (useful phrases, clearer ways to say things, misunderstandings to clear up).
+
+Write correction_reason, note, summary and suggestions in English. Keep everything short.
+Reply with JSON only, in exactly this shape:
+{"summary":"...","items":[{"i":0,"correction":null,"correction_reason":null,"better_translation":null,"note":null}],"suggestions":["..."]}`;
+
+  let r;
+  try {
+    r = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-api-key": key,
+        "anthropic-version": "2023-06-01",
+        "anthropic-dangerous-direct-browser-access": "true"
+      },
+      body: JSON.stringify({
+        model: REVIEW_MODEL,
+        max_tokens: 4000,
+        system: instructions,
+        messages: [{ role: "user", content: "Transcript:\n" + JSON.stringify(msgs, null, 1) }]
+      })
+    });
+  } catch (e) { throw { friendly: "Couldn't reach Claude. Check your internet connection." }; }
+
+  if (!r.ok) {
+    let detail = "";
+    try { detail = (await r.json()).error.message; } catch (_) {}
+    if (r.status === 401) throw { friendly: "Claude didn't accept the API key. Check it in the Save menu." };
+    if (r.status === 429) throw { friendly: "Claude is rate-limiting requests right now. Wait a moment and save again." };
+    if (r.status === 400 && /credit|billing/i.test(detail)) throw { friendly: "Your Claude account needs credits. Add them in the Claude Console." };
+    throw { friendly: "Claude returned an error (" + r.status + ")" + (detail ? ": " + detail : ".") };
+  }
+  const j = await r.json();
+  const text = (j.content || []).filter(c => c.type === "text").map(c => c.text).join("");
+  const a = text.indexOf("{"), b = text.lastIndexOf("}");
+  let data;
+  try { data = JSON.parse(text.slice(a, b + 1)); } catch (_) { throw { friendly: "Claude's review came back in an unexpected format. Try saving again." }; }
+  data.byIndex = {};
+  (data.items || []).forEach(it => { if (it && typeof it.i === "number") data.byIndex[it.i] = it; });
+  reviewCache = { sig, data };
+  return data;
+}
+
+/* ---------- Saved transcript (plain, print-friendly) ---------- */
+function transcriptHTML(forPrint, review) {
   const first = state.messages[0], when = new Date(first ? first.time : Date.now());
-  const turns = state.messages.map(m => `
-    <div class="turn ${m.from}">
-      <p class="who">${fmtTime(m.time)} &nbsp;·&nbsp; Person ${m.from} <span>(${esc(langName(m.src))})</span></p>
+  const turns = state.messages.map((m, i) => {
+    const rv = review && review.byIndex[i];
+    let extra = "";
+    if (rv && rv.correction) extra += `<p class="fix"><b>Correction:</b> <span dir="${dirOf(m.src)}" lang="${m.src}">${esc(rv.correction)}</span>${rv.correction_reason ? ` <i>(${esc(rv.correction_reason)})</i>` : ""}</p>`;
+    if (rv && rv.better_translation) extra += `<p class="fix"><b>Better translation:</b> <span dir="${dirOf(m.to)}" lang="${m.to}">${esc(rv.better_translation)}</span></p>`;
+    if (rv && rv.note) extra += `<p class="fix"><b>Note:</b> ${esc(rv.note)}</p>`;
+    return `
+    <div class="turn">
+      <p class="who">${fmtTime(m.time)} - Person ${m.from} (${esc(langName(m.src))})</p>
       <p class="orig" dir="${dirOf(m.src)}" lang="${m.src}">${esc(m.original)}</p>
-      <p class="tr" dir="${dirOf(m.to)}" lang="${m.to}"><span class="tag">${esc(langName(m.to))}:</span> ${esc(m.translated || "")}</p>
-    </div>`).join("");
+      <p class="tr" dir="${dirOf(m.to)}" lang="${m.to}">${esc(langName(m.to))}: ${esc(m.translated || "")}</p>
+      ${extra}
+    </div>`;
+  }).join("");
+  const summary = review && review.summary ? `<p class="summary"><b>Summary:</b> ${esc(review.summary)}</p>` : "";
+  const tips = review && review.suggestions && review.suggestions.length
+    ? `<h2>Suggestions</h2><ul>${review.suggestions.map(s => `<li>${esc(s)}</li>`).join("")}</ul>` : "";
   return `<!doctype html><html><head><meta charset="utf-8"><title>Conversation ${fileStamp()}</title>
 <style>
-body{font-family:"IBM Plex Sans","Apple SD Gothic Neo","PingFang SC","Geeza Pro",Arial,sans-serif;color:#15202b;max-width:720px;margin:32px auto;padding:0 20px;line-height:1.5}
-h1{font-size:22px;margin:0 0 4px}
-.info{color:#5a6976;font-size:13px;margin:0 0 20px;border-bottom:1px solid #d6dee4;padding-bottom:12px}
-.turn{padding:10px 0 10px 12px;border-left:3px solid #0d7466;margin:0 0 12px;page-break-inside:avoid}
-.turn.B{border-left-color:#b0501c}
-.who{font-size:12px;color:#5a6976;margin:0;font-weight:600}
-.orig{font-size:16px;margin:2px 0}
-.tr{font-size:14px;color:#3b4853;margin:0}
-.tag{font-size:12px;color:#5a6976}
+body{font-family:Arial,"Apple SD Gothic Neo","PingFang SC","Geeza Pro",sans-serif;color:#000;max-width:700px;margin:24px auto;padding:0 20px;line-height:1.45;font-size:14px}
+h1{font-size:20px;margin:0 0 4px}
+h2{font-size:16px;margin:24px 0 6px}
+.info{margin:0 0 14px;color:#444}
+.summary{margin:0 0 14px}
+.turn{padding:8px 0;border-top:1px solid #ccc;page-break-inside:avoid}
+.who{margin:0;font-size:12px;color:#444}
+.orig{margin:2px 0;font-size:15px}
+.tr{margin:0;color:#333}
+.fix{margin:4px 0 0 16px;color:#222;font-size:13px}
+ul{margin:0;padding-left:20px}
 [dir=rtl]{text-align:right}
-.bar{margin:0 0 20px}
-.bar button{font:600 14px Arial,sans-serif;padding:8px 14px;border-radius:8px;border:1px solid #15202b;background:#15202b;color:#fff;cursor:pointer}
+.bar{margin:0 0 16px}
+.bar button{font:14px Arial,sans-serif;padding:6px 12px;cursor:pointer}
 @media print{.bar{display:none}body{margin:0 auto}}
 </style></head><body>
 ${forPrint ? '<div class="bar"><button onclick="window.print()">Save as PDF / Print</button></div>' : ""}
 <h1>Conversation transcript</h1>
-<p class="info">${when.toLocaleDateString(undefined, { year: "numeric", month: "long", day: "numeric" })} &nbsp;·&nbsp; Person A: ${esc(langName(state.A.lang))} &nbsp;·&nbsp; Person B: ${esc(langName(state.B.lang))} &nbsp;·&nbsp; ${state.messages.length} messages</p>
+<p class="info">${when.toLocaleDateString(undefined, { year: "numeric", month: "long", day: "numeric" })} - Person A: ${esc(langName(state.A.lang))} - Person B: ${esc(langName(state.B.lang))} - ${state.messages.length} messages</p>
+${summary}
 ${turns}
+${tips}
 </body></html>`;
 }
 
-function transcriptText() {
+function transcriptText(review) {
   const lines = ["Conversation transcript", new Date().toLocaleString(), ""];
-  state.messages.forEach(m => {
+  if (review && review.summary) lines.push("Summary: " + review.summary, "");
+  state.messages.forEach((m, i) => {
+    const rv = review && review.byIndex[i];
     lines.push("[" + fmtTime(m.time) + "] Person " + m.from + " (" + langName(m.src) + ")");
     lines.push("  " + m.original);
     lines.push("  → " + langName(m.to) + ": " + (m.translated || ""));
+    if (rv && rv.correction) lines.push("  * Correction: " + rv.correction + (rv.correction_reason ? " (" + rv.correction_reason + ")" : ""));
+    if (rv && rv.better_translation) lines.push("  * Better translation: " + rv.better_translation);
+    if (rv && rv.note) lines.push("  * Note: " + rv.note);
     lines.push("");
   });
+  if (review && review.suggestions && review.suggestions.length) {
+    lines.push("Suggestions");
+    review.suggestions.forEach(s => lines.push("  - " + s));
+  }
   return lines.join("\n");
 }
 
@@ -477,21 +610,37 @@ function download(name, type, content) {
   setTimeout(() => { URL.revokeObjectURL(url); a.remove(); }, 1000);
 }
 
-function saveAs(kind) {
+let saving = false;
+async function saveAs(kind) {
   $("saveMenu").open = false;
   if (!state.messages.length) { setStatus("Nothing to save yet. Have a conversation first."); return; }
-  if (kind === "doc") {
-    download("conversation-" + fileStamp() + ".doc", "application/msword", transcriptHTML(false));
-    setStatus("Saved a Word document to your Downloads folder.");
-  } else if (kind === "txt") {
-    download("conversation-" + fileStamp() + ".txt", "text/plain;charset=utf-8", transcriptText());
-    setStatus("Saved a text file to your Downloads folder.");
-  } else {
-    const w = window.open("", "_blank");
+  if (saving) return;
+  // The PDF window must open right away, or the browser treats it as a pop-up
+  let w = null;
+  if (kind === "pdf") {
+    w = window.open("", "_blank");
     if (!w) { setStatus("Your browser blocked the new window. Allow pop-ups for this site and try again.", true); return; }
-    w.document.write(transcriptHTML(true)); w.document.close();
+    w.document.write("<p style='font:15px Arial;margin:24px'>Preparing transcript…</p>");
+  }
+  let review = null, note = "";
+  if (reviewWanted()) {
+    saving = true;
+    setStatus("Claude is reviewing the conversation for suggestions and corrections…");
+    try { review = await getReview(); }
+    catch (e) { note = " Saved without suggestions: " + (e && e.friendly ? e.friendly : "the review failed."); }
+    saving = false;
+  }
+  const err = !!note;
+  if (kind === "doc") {
+    download("conversation-" + fileStamp() + ".doc", "application/msword", transcriptHTML(false, review));
+    setStatus("Saved a Word document to your Downloads folder." + note, err);
+  } else if (kind === "txt") {
+    download("conversation-" + fileStamp() + ".txt", "text/plain;charset=utf-8", transcriptText(review));
+    setStatus("Saved a text file to your Downloads folder." + note, err);
+  } else {
+    w.document.open(); w.document.write(transcriptHTML(true, review)); w.document.close();
     setTimeout(() => { try { w.focus(); w.print(); } catch (_) {} }, 400);
-    setStatus("Opened the transcript. Choose Save as PDF in the print window.");
+    setStatus("Opened the transcript. Choose Save as PDF in the print window." + note, err);
   }
 }
 $("saveDoc").onclick = () => saveAs("doc");
