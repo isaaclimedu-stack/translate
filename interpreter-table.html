@@ -527,11 +527,30 @@ function openRec(side) {
   };
   r.onend = () => {
     if (rec !== r) return;
-    // Chrome ends sessions on its own after a while; keep going if the speaker hasn't finished
-    if (listen.want && state.active === side) { try { openRec(side); return; } catch (_) {} }
+    // Chrome ends a session by itself after a pause; if the speaker hasn't finished, start a new one
+    if (listen.want && state.active === side) {
+      // Keep words that were still being recognized when the session ended, so they aren't lost
+      if (listen.interim) {
+        listen.finalText += (listen.finalText && !noSpaceLang(lang) ? " " : "") + listen.interim;
+        listen.interim = "";
+        setLive(side, listen.finalText, "");
+      }
+      rec = null;
+      restartRec(side, 0);
+      return;
+    }
     finalize();
   };
   r.start();
+}
+function restartRec(side, attempt) {
+  if (!listen.want || state.active !== side) return; // finished or cancelled in the meantime
+  try { openRec(side); }
+  catch (_) {
+    rec = null;
+    if (attempt < 8) setTimeout(() => restartRec(side, attempt + 1), 200);
+    else finishListening();
+  }
 }
 
 function setLive(side, finalText, interim) {
@@ -678,7 +697,7 @@ function renderCards() {
     const mine = state.active === s;
     $("mic" + s).innerHTML = mine ? ICON.stop : ICON.mic;
     $("mic" + s).setAttribute("aria-label", mine ? "Finish speaking" : "Talk as Person " + s);
-    $("mtitle" + s).textContent = mine ? "Listening… tap to finish" : "Tap to speak";
+    $("mtitle" + s).textContent = !mine ? "Tap to speak" : isHolding(s) ? "Holding: pauses won't cut off" : "Listening… tap to finish";
     $("msub" + s).textContent = "Speak " + LANGS[L].name + " · or " + (s === "A" ? "Left" : "Right") + " Shift";
   });
 }
@@ -1044,9 +1063,12 @@ $("savePdf").onclick = () => saveAs("pdf");
 $("saveTxt").onclick = () => saveAs("txt");
 
 /* Left Shift = Person A, Right Shift = Person B.
-   Tap once to start and tap again to finish, or hold while talking and release to finish. */
+   Tap once to start and tap again to finish (stops after a few seconds of silence),
+   or hold while talking: it keeps listening through any pause and finishes only when the key is released. */
 const SHIFT_SIDE = { ShiftLeft: "A", ShiftRight: "B" };
-let shiftDownAt = 0;
+const HOLD_MS = 600;
+let shiftDownAt = 0, holdTimer = null;
+const isHolding = s => holding === s && performance.now() - shiftDownAt > HOLD_MS;
 const typingTarget = e => e.target.closest && e.target.closest("input, textarea, select");
 document.addEventListener("keydown", e => {
   if (e.repeat || e.metaKey || e.ctrlKey || e.altKey || typingTarget(e)) return;
@@ -1056,16 +1078,26 @@ document.addEventListener("keydown", e => {
   if (state.active === side) { finishListening(); return; }
   startListening(side);
   holding = side; shiftDownAt = performance.now();
+  clearTimeout(holdTimer);
+  holdTimer = setTimeout(() => {
+    if (holding === side && state.active === side) {
+      clearTimeout(silenceTimer);
+      renderCards();
+      setStatus("Holding " + (side === "A" ? "Left" : "Right") + " Shift: it keeps listening through pauses. Let go when Person " + side + " has finished.");
+    }
+  }, HOLD_MS + 20);
 });
 document.addEventListener("keyup", e => {
   const side = SHIFT_SIDE[e.code];
   if (!side || holding !== side) return;
-  holding = null;
-  // Held longer than a tap: treat it as push-to-talk and finish on release
-  if (performance.now() - shiftDownAt > 600 && state.active === side) finishListening();
-  else if (state.active === side) armSilence();
+  const held = performance.now() - shiftDownAt > HOLD_MS;
+  holding = null; clearTimeout(holdTimer);
+  // Held longer than a tap: push-to-talk, so finish now that the key is released
+  if (held && state.active === side) finishListening();
+  else if (state.active === side) { armSilence(); renderCards(); }
 });
-window.addEventListener("blur", () => { holding = null; });
+// If the window loses focus mid-hold, the key release can't be seen; fall back to the pause timer
+window.addEventListener("blur", () => { if (holding) { const s = holding; holding = null; clearTimeout(holdTimer); if (state.active === s) armSilence(); } });
 
 /* ---------- Start ---------- */
 restore();
