@@ -299,6 +299,7 @@ dialog::backdrop{background:rgba(10,16,32,.45)}
     <label class="switch"><span><b>Read translations aloud</b><small>Plays each translation for the other person.</small></span><input type="checkbox" id="optSpeak"></label>
     <label class="switch"><span><b>Hands-free turns</b><small>After a translation plays, the other person's mic turns on.</small></span><input type="checkbox" id="optHands"></label>
     <label class="switch"><span><b>Flip top card on phones</b><small>So someone sitting across the table can read it.</small></span><input type="checkbox" id="optFlip"></label>
+    <label class="switch"><span><b>Filter bad language</b><small>Removes swear words and slurs before they're shown, translated, read aloud or saved. Also catches words the mic misheard.</small></span><input type="checkbox" id="optFilter" checked></label>
     <div class="row"><button class="btn danger" type="button" id="clear">Clear conversation</button></div>
     <p class="hint">Keyboard: Left Shift talks for Person A, Right Shift for Person B. Tap to start and tap again to finish, or hold while you talk.</p>
   </div>
@@ -320,7 +321,7 @@ const state = {
   A: { lang: "en" }, B: { lang: "ko" },
   messages: [], live: null, active: null, lastSpeaker: null,
   phase: "idle", phaseSide: null,       // idle | listening | processing | playing ; phaseSide = who spoke
-  speak: false, handsFree: false, flip: false
+  speak: false, handsFree: false, flip: false, filter: true
 };
 const other = s => (s === "A" ? "B" : "A");
 const dirOf = l => (l === "ar" ? "rtl" : "ltr");
@@ -553,17 +554,83 @@ function restartRec(side, attempt) {
   }
 }
 
+/* ---------- Bad-language filter ----------
+   Removes swear words and slurs before anything is shown, translated, read aloud or saved.
+   Runs on what was heard (in the speaker's language) and again on the translation.
+   English words are checked in every language, since people often mix them in. */
+const BAD = {
+  // Latin-script languages: whole words only, so ordinary words that contain these letters are safe
+  en: ["\\p{L}*f+u+c+k+\\p{L}*", "(?:bull|horse|dip|chicken|bat|ape)?shit\\p{L}*", "bitch\\p{L}*", "bastard\\p{L}*",
+       "(?:dumb|jack|smart|bad|fat|kick|lard)?ass(?:es|hole|holes|hat|hats|wipe|wipes)?", "arse(?:hole|holes|s)?",
+       "dick(?:s|head|heads)?", "cock(?:s|sucker\\p{L}*)?", "cunt\\p{L}*", "puss(?:y|ies)", "(?:god)?damn(?:ed|it)?",
+       "crap(?:py|s)?", "piss(?:ed|es|ing)?", "slut\\p{L}*", "whore\\p{L}*", "wank\\p{L}*", "twats?", "pricks?",
+       "bollocks", "tits?", "titties", "nigg(?:a|as|az|er|ers)", "fag(?:s|got|gots)?", "retard(?:s|ed)?", "stfu", "wtf", "mf"],
+  es: ["mierd\\p{L}*", "put[ao]s?", "putit[ao]s?", "pendej\\p{L}*", "cabr[oó]n(?:es|a|as)?", "coños?",
+       "jod(?:er|ido|ida|idos|idas|ete|anse|an|iendo)", "gilipoll\\p{L}*", "carajo\\p{L}*",
+       "ching(?:a|as|ar|ada|adas|ado|ados|ue|ues|ón|ona|ones|aste|ate)", "vergas?", "culer[oa]s?", "culos?",
+       "maric[oó]n(?:es|a|as)?", "cojon(?:es|udo|uda)?", "foll(?:ar|ando|ado|ada)", "mam[oó]n(?:es|a)?", "pinches?",
+       "hijueputa\\p{L}*", "hdp"],
+  fr: ["merd\\p{L}*", "putains?", "putes?", "salop(?:e|es|ard|ards|erie)", "conn(?:ard|ards|arde|asse|asses|e|es|erie|eries)",
+       "cons?", "encul\\p{L}*", "fout(?:re|u|ue|us|ues|ez)?", "niqu\\p{L}*", "(?:ferme )?ta gueule", "bordel\\p{L}*",
+       "bites?", "couill\\p{L}*", "chier", "chiant\\p{L}*", "p[ée]tasses?", "b[aâ]tard\\p{L}*", "enfoir[ée]\\p{L}*", "ntm"],
+  // Korean: the whole word (with its particle) is removed
+  ko: ["씨발", "씨바", "씨팔", "시발(?!점|역)", "씨부랄", "씨부럴", "씹새", "씹할", "씹년", "씹놈", "씹창", "좆", "존나", "졸라",
+       "개새끼", "개새기", "개색기", "개색히", "개새", "개년", "개놈", "개자식", "병신", "븅신", "빙신", "지랄", "미친놈", "미친년",
+       "미친새끼", "썅", "쌍놈", "쌍년", "니미", "니애미", "느금마", "엠창", "염병", "엿먹어", "ㅅㅂ", "ㅆㅂ", "ㅂㅅ", "ㅈㄹ"],
+  // Mandarin and Cantonese (simplified and traditional): the phrase itself is removed
+  zh: ["他妈的", "他媽的", "你妈的", "你媽的", "去你妈", "去你媽", "妈的", "媽的", "操你", "草你", "我操", "肏", "傻逼", "傻屄", "傻B",
+       "煞笔", "牛逼", "牛B", "装逼", "裝逼", "二逼", "妈逼", "媽逼", "屄", "屌", "鸡巴", "雞巴", "婊子", "王八蛋", "混蛋", "狗屎",
+       "滚蛋", "滾蛋", "草泥马", "草泥馬", "尼玛", "尼瑪", "贱人", "賤人", "狗日的", "日你", "干你娘", "幹你娘", "靠北", "机掰", "雞掰",
+       "傻叉", "屁眼", "𨳒", "撚", "閪", "仆街", "扑街", "冚家鏟", "冚家铲", "戇鳩", "戆鸠", "鳩樣", "鸠样", "on9", "柒頭", "柒头",
+       "丟你", "丢你", "你老母", "老母臭"],
+  // Arabic: exact words (with an optional و / ف in front)
+  ar: ["كس امك", "كس أمك", "ابن الكلب", "ابن كلب", "ابن الشرموطة", "ابن العاهرة", "كسمك", "كسختك", "كسك", "كس", "زبي", "زبك", "زبر", "زب",
+       "شرموطة", "شرموطه", "شرموط", "شراميط", "قحبة", "قحبه", "قحاب", "عاهرة", "عاهره", "منيوكة", "منيوكه", "منيوك", "متناكة", "متناك",
+       "خول", "انيكك", "أنيكك", "نيكك", "نيك", "طيزك", "طيز", "يلعن", "خراء", "خرا"]
+};
+const BAD_RX = (() => {
+  const latin = list => new RegExp("(?<![\\p{Script=Latin}\\p{N}])(?:" + list.join("|") + ")(?![\\p{Script=Latin}\\p{N}])", "giu");
+  return {
+    en: latin(BAD.en), es: latin(BAD.es), fr: latin(BAD.fr),
+    ko: new RegExp("[^\\s]*(?:" + BAD.ko.join("|") + ")[^\\s]*", "gu"),
+    zh: new RegExp("(?:" + BAD.zh.join("|") + ")", "giu"),
+    ar: new RegExp("(?<![\\u0621-\\u064A])[وف]?(?:" + BAD.ar.join("|") + ")(?![\\u0621-\\u064A])", "gu"),
+    masked: /[\p{L}\p{N}]*\*+[\p{L}\p{N}*]*/gu   // words the speech recognizer already starred out, e.g. "f***"
+  };
+})();
+const FILTER_SETS = { en: ["en"], es: ["en", "es"], fr: ["en", "fr"], ko: ["en", "ko"], zh: ["en", "zh"], yue: ["en", "zh"], ar: ["en", "ar"] };
+function cleanText(text, lang) {
+  if (!state.filter || !text) return { text: text || "", count: 0 };
+  let count = 0;
+  const cut = () => { count++; return " "; };
+  let t = text.replace(BAD_RX.masked, cut);
+  const cutTight = () => { count++; return ""; }; // Chinese has no spaces between words
+  (FILTER_SETS[lang] || ["en"]).forEach(k => { t = t.replace(BAD_RX[k], k === "zh" ? cutTight : cut); });
+  if (count) {
+    t = t.replace(/\s+/g, " ")
+         .replace(/\s+([,.!?;:،؟。，！？、])/g, "$1")
+         .replace(/([,،，、])(?:\s*[,،，、])+/g, "$1")
+         .replace(/^[\s,.!?;:،؟。，！？、]+/, "")
+         .replace(/[\s,،，、]+([.!?。！？؟])/g, "$1")
+         .trim();
+    if (!/[\p{L}\p{N}]/u.test(t)) t = "";
+  }
+  return { text: t, count };
+}
+
 function setLive(side, finalText, interim) {
   if (!state.live) return;
-  state.live.original = finalText;
-  state.live.interim = interim;
+  const L = state[side].lang;
+  state.live.original = cleanText(finalText, L).text;
+  state.live.interim = cleanText(interim, L).text;
   renderCards();
-  const full = (finalText + (finalText && interim && !noSpaceLang(state[side].lang) ? " " : "") + interim).trim();
+  const full = cleanText((finalText + (finalText && interim && !noSpaceLang(L) ? " " : "") + interim).trim(), L).text;
   clearTimeout(liveTimer);
   const seq = ++liveSeq;
   liveTimer = setTimeout(async () => {
     try {
-      const t = await translate(full, state[side].lang, state[other(side)].lang);
+      const toL = state[other(side)].lang;
+      const t = full ? cleanText(await translate(full, L, toL), toL).text : "";
       if (seq === liveSeq && state.live) { state.live.translated = t; renderCards(); }
     } catch (_) {}
   }, 300);
@@ -575,13 +642,22 @@ async function commit(side, text) {
   if (!text) return;
   liveSeq++;
   const to = other(side);
-  const m = { from: side, src: state[side].lang, to: state[to].lang, time: Date.now(), original: text, translated: null };
+  const heard = cleanText(text, state[side].lang);
+  if (!heard.text) {
+    setPhase("idle");
+    setStatus("Nothing was translated. What was heard was filtered as bad language.");
+    return;
+  }
+  text = heard.text;
+  const m = { from: side, src: state[side].lang, to: state[to].lang, time: Date.now(), original: text, translated: null, filtered: heard.count };
   state.messages.push(m);
   state.lastSpeaker = side;
   setPhase("processing", side);
   try {
-    m.translated = await translate(text, m.src, m.to);
-    setStatus("");
+    const out = cleanText(await translate(text, m.src, m.to), m.to);
+    m.translated = out.text || "(Filtered)";
+    m.filtered += out.count;
+    setStatus(m.filtered ? (m.filtered === 1 ? "1 word was filtered as bad language." : m.filtered + " words were filtered as bad language.") : "");
   } catch (e) {
     m.translated = "(Couldn't translate. Check your internet connection.)";
     setStatus("Couldn't reach the translation service. Check your internet connection.", true);
@@ -597,7 +673,7 @@ async function retranslateAll() {
   });
   renderAll();
   for (const m of state.messages) if (m.translated === null) {
-    try { m.translated = await translate(m.original, m.src, m.to); } catch (_) { m.translated = "(Couldn't translate.)"; }
+    try { m.translated = cleanText(await translate(m.original, m.src, m.to), m.to).text || "(Filtered)"; } catch (_) { m.translated = "(Couldn't translate.)"; }
     renderAll();
   }
 }
@@ -686,7 +762,7 @@ function renderCards() {
     else if (ph === "playing" && ps !== s) { cls = "playing"; html = ICON.speaker + '<span class="dots">Playing translation</span>'; }
     else if (ph === "playing") { html = "Playing the translation for Person " + other(s); }
     else if (isListener && latest.translated && state.speak) { html = `<button type="button" data-replay>${ICON.speaker}Play translation</button>`; }
-    else if (latest) { html = "Sent at " + fmtTime(latest.time); }
+    else if (latest) { html = "Sent at " + fmtTime(latest.time) + (latest.filtered ? " · " + latest.filtered + (latest.filtered === 1 ? " word" : " words") + " filtered" : ""); }
     else { html = SR ? "Ready" : "Voice input needs Chrome or Edge"; }
     st.className = "state " + cls;
     st.innerHTML = html;
@@ -730,7 +806,7 @@ function renderHistory() {
   $("histList").innerHTML = state.messages.map((m, i) => `<li class="hitem ${m.from}">
       <span class="badge">${m.from}</span>
       <div style="min-width:0">
-        <div class="hmeta">Person ${m.from} · ${esc(langName(m.src))} → ${esc(langName(m.to))} · ${fmtTime(m.time)}</div>
+        <div class="hmeta">Person ${m.from} · ${esc(langName(m.src))} → ${esc(langName(m.to))} · ${fmtTime(m.time)}${m.filtered ? " · filtered" : ""}</div>
         <p class="horig" dir="${dirOf(m.src)}" lang="${m.src}">${esc(m.original)}</p>
         <p class="htr" dir="${dirOf(m.to)}" lang="${m.to}">${esc(m.translated ?? "Translating…")}</p>
       </div>
@@ -953,7 +1029,7 @@ async function saveAs(kind) {
 
 /* ---------- Remember the conversation in this browser ---------- */
 function save() {
-  try { localStorage.setItem("interpreterTable", JSON.stringify({ A: state.A.lang, B: state.B.lang, readAloud: state.speak, handsFree: state.handsFree, flip: state.flip, messages: state.messages.filter(m => m.translated !== null) })); } catch (_) {}
+  try { localStorage.setItem("interpreterTable", JSON.stringify({ A: state.A.lang, B: state.B.lang, readAloud: state.speak, handsFree: state.handsFree, flip: state.flip, filter: state.filter, messages: state.messages.filter(m => m.translated !== null) })); } catch (_) {}
 }
 function restore() {
   try {
@@ -964,6 +1040,7 @@ function restore() {
       if (typeof saved.readAloud === "boolean") state.speak = saved.readAloud;
       if (typeof saved.handsFree === "boolean") state.handsFree = saved.handsFree;
       if (typeof saved.flip === "boolean") state.flip = saved.flip;
+      if (typeof saved.filter === "boolean") state.filter = saved.filter;
       if (Array.isArray(saved.messages)) {
         state.messages = saved.messages.filter(m => m && LANGS[m.src]).map(m => ({ ...m, to: LANGS[m.to] ? m.to : state[m.from === "A" ? "B" : "A"].lang, time: m.time || Date.now() }));
         const last = state.messages[state.messages.length - 1];
@@ -996,6 +1073,7 @@ $("voiceToggle").onclick = () => {
 $("optSpeak").onchange = e => { state.speak = e.target.checked; if (!state.speak) stopSpeaking(); renderAll(); };
 $("optHands").onchange = e => { state.handsFree = e.target.checked; save(); };
 $("optFlip").onchange = e => { state.flip = e.target.checked; renderAll(); };
+$("optFilter").onchange = e => { state.filter = e.target.checked; save(); setStatus(state.filter ? "Bad-language filter is on." : "Bad-language filter is off. Everything heard will be translated."); };
 let undoData = null, undoTimer = null;
 function clearConversation() {
   if (!state.messages.length && !state.active) { setStatus("The conversation is already empty."); return; }
@@ -1021,7 +1099,7 @@ $("clear").onclick = clearConversation;
 
 function openDialog(id) {
   if (id === "dlgSave") updateReviewState();
-  if (id === "dlgSettings") { $("optSpeak").checked = state.speak; $("optHands").checked = state.handsFree; $("optFlip").checked = state.flip; }
+  if (id === "dlgSettings") { $("optSpeak").checked = state.speak; $("optHands").checked = state.handsFree; $("optFlip").checked = state.flip; $("optFilter").checked = state.filter; }
   const d = $(id); if (!d.open) d.showModal();
 }
 document.querySelectorAll("dialog").forEach(d => {
